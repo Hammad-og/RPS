@@ -1,7 +1,7 @@
 """
-Rock, Paper, Scissors Telegram Bot
-PvP: Both players pick on the GROUP message — choices hidden until both lock in.
-No DM required. Railway-safe.
+Rock Paper Scissors — Telegram Bot
+PvP works entirely in the group chat, no DM needed.
+Railway-safe: stdout logging, no close_loop, dotenv optional.
 """
 
 import logging
@@ -11,296 +11,299 @@ import os
 import sys
 import time
 from enum import Enum
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    BotCommand,
-)
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-)
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from telegram.constants import ParseMode
-from telegram.error import TelegramError
+from telegram.error import TelegramError, BadRequest
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format="%(asctime)s [%(levelname)s] %(message)s",
     level=logging.INFO,
-    handlers=[logging.StreamHandler(sys.stdout)]
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger(__name__)
 
-# ── Enums ─────────────────────────────────────────────────────────────────────
+# ── Choices ───────────────────────────────────────────────────────────────────
 class Choice(Enum):
     ROCK     = "🪨 Rock"
     PAPER    = "📄 Paper"
     SCISSORS = "✂️ Scissors"
 
-# ── PvP game store ────────────────────────────────────────────────────────────
-pvp_games: dict = {}
-CHALLENGE_TIMEOUT = 60
-CHOICE_TIMEOUT    = 120
+CHOICE_FROM_STR = {"rock": Choice.ROCK, "paper": Choice.PAPER, "scissors": Choice.SCISSORS}
+
+def beats(a: Choice, b: Choice) -> int:
+    """Return 1 if a beats b, -1 if b beats a, 0 for draw."""
+    if a == b:
+        return 0
+    wins = {(Choice.ROCK, Choice.SCISSORS), (Choice.SCISSORS, Choice.PAPER), (Choice.PAPER, Choice.ROCK)}
+    return 1 if (a, b) in wins else -1
+
+# ── In-memory PvP store ───────────────────────────────────────────────────────
+pvp_games: dict = {}          # cid -> game dict
+CHALLENGE_TTL = 60            # seconds to accept
+PICK_TTL      = 120           # seconds to pick after accepting
 
 # ── Database ──────────────────────────────────────────────────────────────────
 DB_PATH = os.getenv("DB_PATH", "rps_stats.db")
 
-def init_database():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS users (
-        user_id      INTEGER PRIMARY KEY,
-        username     TEXT,
-        first_name   TEXT,
-        last_name    TEXT,
-        wins         INTEGER DEFAULT 0,
-        losses       INTEGER DEFAULT 0,
-        draws        INTEGER DEFAULT 0,
-        total_games  INTEGER DEFAULT 0,
-        pvp_wins     INTEGER DEFAULT 0,
-        pvp_losses   INTEGER DEFAULT 0,
-        pvp_draws    INTEGER DEFAULT 0,
-        pvp_games    INTEGER DEFAULT 0,
-        last_played  TIMESTAMP,
-        joined_date  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS game_history (
-        id          INTEGER PRIMARY KEY,
-        user_id     INTEGER,
-        opponent_id INTEGER,
-        user_choice TEXT,
-        bot_choice  TEXT,
-        result      TEXT,
-        game_type   TEXT DEFAULT 'bot',
-        played_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY(user_id) REFERENCES users(user_id)
-    )''')
-    for col, default in [("pvp_wins","0"),("pvp_losses","0"),("pvp_draws","0"),("pvp_games","0"),("last_name","''")]:
-        try:
-            c.execute(f"ALTER TABLE users ADD COLUMN {col} INTEGER DEFAULT {default}")
-        except Exception:
-            pass
-    try:
-        c.execute("ALTER TABLE game_history ADD COLUMN game_type TEXT DEFAULT 'bot'")
-    except Exception:
-        pass
-    conn.commit()
-    conn.close()
-    logger.info("DB ready: %s", DB_PATH)
+def db():
+    c = sqlite3.connect(DB_PATH, check_same_thread=False)
+    c.row_factory = sqlite3.Row
+    return c
 
-def get_db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+def init_db():
+    with db() as conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id     INTEGER PRIMARY KEY,
+                username    TEXT,
+                first_name  TEXT,
+                last_name   TEXT,
+                wins        INTEGER DEFAULT 0,
+                losses      INTEGER DEFAULT 0,
+                draws       INTEGER DEFAULT 0,
+                total_games INTEGER DEFAULT 0,
+                pvp_wins    INTEGER DEFAULT 0,
+                pvp_losses  INTEGER DEFAULT 0,
+                pvp_draws   INTEGER DEFAULT 0,
+                pvp_games   INTEGER DEFAULT 0,
+                last_played TIMESTAMP,
+                joined_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS game_history (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     INTEGER,
+                opponent_id INTEGER,
+                user_choice TEXT,
+                opp_choice  TEXT,
+                result      TEXT,
+                game_type   TEXT DEFAULT 'bot',
+                played_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+    # safe column migrations for old DBs
+    with db() as conn:
+        for col in ["pvp_wins INTEGER DEFAULT 0", "pvp_losses INTEGER DEFAULT 0",
+                    "pvp_draws INTEGER DEFAULT 0", "pvp_games INTEGER DEFAULT 0",
+                    "last_name TEXT"]:
+            try:
+                conn.execute(f"ALTER TABLE users ADD COLUMN {col}")
+            except Exception:
+                pass
+    logger.info("DB ready → %s", DB_PATH)
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def display_name(user) -> str:
-    if user.first_name:
-        return (user.first_name + (" " + user.last_name if user.last_name else "")).strip()
-    return f"@{user.username}" if user.username else "Player"
+def upsert_user(u):
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO users(user_id,username,first_name,last_name) VALUES(?,?,?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, "
+            "first_name=excluded.first_name, last_name=excluded.last_name",
+            (u.id, u.username or "", u.first_name or "", u.last_name or ""),
+        )
 
-def display_name_db(row) -> str:
-    full = f"{row.get('first_name') or ''} {row.get('last_name') or ''}".strip()
-    return full or (f"@{row['username']}" if row.get('username') else "Player")
-
-def ensure_user(user):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT user_id FROM users WHERE user_id=?", (user.id,))
-    if c.fetchone():
-        c.execute("UPDATE users SET username=?,first_name=?,last_name=? WHERE user_id=?",
-                  (user.username or "", user.first_name or "", user.last_name or "", user.id))
-    else:
-        c.execute("INSERT INTO users(user_id,username,first_name,last_name) VALUES(?,?,?,?)",
-                  (user.id, user.username or "", user.first_name or "", user.last_name or ""))
-    conn.commit()
-    conn.close()
-
-def get_stats(user_id):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
-    row = c.fetchone()
-    conn.close()
+def fetch_stats(uid: int):
+    row = db().execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
     return dict(row) if row else None
 
-def save_bot_game(user_id, user_choice, bot_choice, result):
-    conn = get_db()
-    c = conn.cursor()
-    col = {'win':'wins','loss':'losses','draw':'draws'}[result]
-    c.execute(f"UPDATE users SET {col}={col}+1, total_games=total_games+1, last_played=CURRENT_TIMESTAMP WHERE user_id=?", (user_id,))
-    c.execute("INSERT INTO game_history(user_id,opponent_id,user_choice,bot_choice,result,game_type) VALUES(?,?,?,?,?,?)",
-              (user_id, 0, user_choice, bot_choice, result, 'bot'))
-    conn.commit()
-    conn.close()
+def record_bot(uid, uchoice, bchoice, result):
+    col = {"win": "wins", "loss": "losses", "draw": "draws"}[result]
+    with db() as conn:
+        conn.execute(
+            f"UPDATE users SET {col}={col}+1, total_games=total_games+1, "
+            "last_played=CURRENT_TIMESTAMP WHERE user_id=?", (uid,)
+        )
+        conn.execute(
+            "INSERT INTO game_history(user_id,opponent_id,user_choice,opp_choice,result,game_type) "
+            "VALUES(?,0,?,?,?,'bot')", (uid, uchoice, bchoice, result)
+        )
 
-def save_pvp_game(user_id, opp_id, user_choice, opp_choice, result):
-    conn = get_db()
-    c = conn.cursor()
-    col = {'win':'pvp_wins','loss':'pvp_losses','draw':'pvp_draws'}[result]
-    c.execute(f"UPDATE users SET {col}={col}+1, pvp_games=pvp_games+1, last_played=CURRENT_TIMESTAMP WHERE user_id=?", (user_id,))
-    c.execute("INSERT INTO game_history(user_id,opponent_id,user_choice,bot_choice,result,game_type) VALUES(?,?,?,?,?,?)",
-              (user_id, opp_id, user_choice, opp_choice, result, 'pvp'))
-    conn.commit()
-    conn.close()
+def record_pvp(uid, oid, uchoice, ochoice, result):
+    col = {"win": "pvp_wins", "loss": "pvp_losses", "draw": "pvp_draws"}[result]
+    with db() as conn:
+        conn.execute(
+            f"UPDATE users SET {col}={col}+1, pvp_games=pvp_games+1, "
+            "last_played=CURRENT_TIMESTAMP WHERE user_id=?", (uid,)
+        )
+        conn.execute(
+            "INSERT INTO game_history(user_id,opponent_id,user_choice,opp_choice,result,game_type) "
+            "VALUES(?,?,?,?,?,'pvp')", (uid, oid, uchoice, ochoice, result)
+        )
 
-def beats(c1: Choice, c2: Choice) -> int:
-    if c1 == c2: return 0
-    return 1 if (c1,c2) in {(Choice.ROCK,Choice.SCISSORS),(Choice.SCISSORS,Choice.PAPER),(Choice.PAPER,Choice.ROCK)} else -1
+# ── Name helpers ──────────────────────────────────────────────────────────────
+def name(user) -> str:
+    n = (user.first_name or "")
+    if user.last_name:
+        n += f" {user.last_name}"
+    return n.strip() or f"@{user.username}" if user.username else "Player"
 
-# ── Keyboard builders ─────────────────────────────────────────────────────────
-def main_kb() -> InlineKeyboardMarkup:
+def name_db(row: dict) -> str:
+    n = f"{row.get('first_name') or ''} {row.get('last_name') or ''}".strip()
+    return n or (f"@{row['username']}" if row.get("username") else "Player")
+
+# ── Keyboards ─────────────────────────────────────────────────────────────────
+def kb_main() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🪨 Rock",     callback_data="play_rock"),
-         InlineKeyboardButton("📄 Paper",    callback_data="play_paper"),
-         InlineKeyboardButton("✂️ Scissors", callback_data="play_scissors")],
+        [
+            InlineKeyboardButton("🪨 Rock",     callback_data="play_rock"),
+            InlineKeyboardButton("📄 Paper",    callback_data="play_paper"),
+            InlineKeyboardButton("✂️ Scissors", callback_data="play_scissors"),
+        ],
         [InlineKeyboardButton("⚔️ Challenge a Friend", callback_data="pvp_challenge")],
-        [InlineKeyboardButton("📊 My Stats",    callback_data="show_stats"),
-         InlineKeyboardButton("🏆 Leaderboard", callback_data="show_leaderboard")],
+        [
+            InlineKeyboardButton("📊 My Stats",    callback_data="show_stats"),
+            InlineKeyboardButton("🏆 Leaderboard", callback_data="show_leaderboard"),
+        ],
         [InlineKeyboardButton("ℹ️ Rules", callback_data="rules")],
     ])
 
-def rematch_kb() -> InlineKeyboardMarkup:
+def kb_rematch() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("🎮 Play Again", callback_data="main_menu"),
-        InlineKeyboardButton("📊 My Stats",   callback_data="show_stats"),
+        InlineKeyboardButton("📊 Stats",      callback_data="show_stats"),
     ]])
 
-def pvp_pick_kb(cid: str) -> InlineKeyboardMarkup:
+def kb_pick(cid: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("🪨", callback_data=f"pvp_pick_{cid}_rock"),
-        InlineKeyboardButton("📄", callback_data=f"pvp_pick_{cid}_paper"),
-        InlineKeyboardButton("✂️", callback_data=f"pvp_pick_{cid}_scissors"),
+        InlineKeyboardButton("🪨 Rock",     callback_data=f"pvp_pick_{cid}_rock"),
+        InlineKeyboardButton("📄 Paper",    callback_data=f"pvp_pick_{cid}_paper"),
+        InlineKeyboardButton("✂️ Scissors", callback_data=f"pvp_pick_{cid}_scissors"),
     ]])
 
-def pvp_newgame_kb() -> InlineKeyboardMarkup:
+def kb_after_pvp() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("🎮 Play vs Bot",   callback_data="main_menu"),
+        InlineKeyboardButton("🎮 vs Bot",       callback_data="main_menu"),
         InlineKeyboardButton("⚔️ New Challenge", callback_data="pvp_challenge"),
     ]])
 
-# ── send helpers ──────────────────────────────────────────────────────────────
-async def answer_query(query, text="", alert=False):
+# ── Safe Telegram helpers ─────────────────────────────────────────────────────
+async def safe_answer(query, text="", alert=False):
     try:
         await query.answer(text, show_alert=alert)
-    except TelegramError:
-        pass
+    except TelegramError as e:
+        logger.debug("answer failed: %s", e)
 
-async def edit_or_send(context, chat_id, message_id, text, markup=None, thread_id=None):
+async def safe_edit(bot, chat_id, msg_id, text, markup=None):
+    """Edit a message. Returns True on success."""
     try:
-        await context.bot.edit_message_text(
-            chat_id=chat_id, message_id=message_id,
-            text=text, parse_mode=ParseMode.HTML, reply_markup=markup,
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=msg_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=markup,
         )
-        return message_id
-    except TelegramError:
-        try:
-            m = await context.bot.send_message(
-                chat_id=chat_id, text=text,
-                parse_mode=ParseMode.HTML, reply_markup=markup,
-                message_thread_id=thread_id,
-            )
-            return m.message_id
-        except TelegramError as e:
-            logger.warning("edit_or_send failed: %s", e)
-            return message_id
+        return True
+    except BadRequest as e:
+        # "message is not modified" is fine — everything else log it
+        if "not modified" not in str(e).lower():
+            logger.warning("edit_message_text BadRequest: %s", e)
+        return False
+    except TelegramError as e:
+        logger.warning("edit_message_text error: %s", e)
+        return False
 
-async def reply_or_send(update, context, text, markup=None):
-    """In groups send new message; in DMs edit existing."""
-    q = update.callback_query
-    await answer_query(q)
-    if update.effective_chat.type in ("group", "supergroup"):
-        try:
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id, text=text,
-                parse_mode=ParseMode.HTML, reply_markup=markup,
-                message_thread_id=update.effective_message.message_thread_id,
-            )
-        except TelegramError as e:
-            logger.warning("reply_or_send group: %s", e)
-    else:
-        try:
-            await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
-        except TelegramError:
-            pass
+async def safe_send(bot, chat_id, text, markup=None, thread_id=None):
+    """Send a new message. Returns message_id or None."""
+    try:
+        m = await bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=markup,
+            message_thread_id=thread_id,
+        )
+        return m.message_id
+    except TelegramError as e:
+        logger.warning("send_message error: %s", e)
+        return None
 
 # ── /start ────────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    ensure_user(user)
+    upsert_user(user)
     await update.message.reply_text(
-        f"🎮 <b>Rock, Paper, Scissors!</b>\n\nHi {display_name(user)}! 👋\n\n"
+        f"🎮 <b>Rock Paper Scissors!</b>\n\n"
+        f"Hi <b>{name(user)}</b>! 👋\n\n"
         f"🤖 Play vs Bot\n"
-        f"⚔️ Challenge a friend — pick secretly, reveal together\n"
+        f"⚔️ Challenge friends in your group\n"
         f"📊 Stats &amp; 🏆 Leaderboard\n\n"
-        f"<i>Pick a move below!</i>",
+        f"<i>Pick a move to start!</i>",
         parse_mode=ParseMode.HTML,
-        reply_markup=main_kb(),
+        reply_markup=kb_main(),
     )
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    ensure_user(user)
+    upsert_user(user)
     await update.message.reply_text(
-        _stats_text(display_name(user), get_stats(user.id)),
+        _fmt_stats(name(user), fetch_stats(user.id)),
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🎮 Play", callback_data="main_menu"),
+            InlineKeyboardButton("🎮 Play",        callback_data="main_menu"),
             InlineKeyboardButton("🏆 Leaderboard", callback_data="show_leaderboard"),
         ]]),
     )
 
 async def cmd_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        _lb_text(), parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎮 Play", callback_data="main_menu")]]),
+        _fmt_lb(), parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🎮 Play", callback_data="main_menu"),
+        ]]),
     )
 
 # ── vs Bot ────────────────────────────────────────────────────────────────────
-async def play_single(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user  = update.effective_user
-    ensure_user(user)
+async def cb_play(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q    = update.callback_query
+    user = update.effective_user
+    upsert_user(user)
 
-    choice_map = {"play_rock": Choice.ROCK, "play_paper": Choice.PAPER, "play_scissors": Choice.SCISSORS}
-    user_choice = choice_map.get(query.data)
-    if not user_choice:
+    uc = {"play_rock": Choice.ROCK, "play_paper": Choice.PAPER, "play_scissors": Choice.SCISSORS}.get(q.data)
+    if not uc:
         return
 
-    bot_choice  = random.choice(list(Choice))
-    r           = beats(user_choice, bot_choice)
-    result_type = {1:"win", -1:"loss", 0:"draw"}[r]
-    emoji       = {"win":"✨","loss":"💔","draw":"⚖️"}[result_type]
-    headline    = {"win":"🎉 <b>YOU WIN!</b>","loss":"😔 <b>YOU LOSE!</b>","draw":"🤝 <b>DRAW!</b>"}[result_type]
+    bc      = random.choice(list(Choice))
+    outcome = beats(uc, bc)
+    rtype   = {1: "win", -1: "loss", 0: "draw"}[outcome]
+    icon    = {"win": "✨", "loss": "💔", "draw": "⚖️"}[rtype]
+    head    = {"win": "🎉 <b>YOU WIN!</b>", "loss": "😔 <b>YOU LOSE!</b>", "draw": "🤝 <b>DRAW!</b>"}[rtype]
 
-    save_bot_game(user.id, user_choice.name, bot_choice.name, result_type)
-    stats = get_stats(user.id)
-    tot   = stats['total_games']
-    wr    = stats['wins'] / tot * 100 if tot else 0
+    record_bot(user.id, uc.name, bc.name, rtype)
+    s   = fetch_stats(user.id)
+    tot = s["total_games"]
+    wr  = s["wins"] / tot * 100 if tot else 0
 
     text = (
-        f"{emoji} <b>{display_name(user)}</b> — {headline}\n\n"
-        f"<b>You:</b> {user_choice.value}   <b>Bot:</b> {bot_choice.value}\n\n"
-        f"<b>📊 Bot record:</b> {stats['wins']}W {stats['losses']}L {stats['draws']}D — {wr:.1f}%"
+        f"{icon} {head}\n\n"
+        f"You: {uc.value}  |  Bot: {bc.value}\n\n"
+        f"📊 {s['wins']}W {s['losses']}L {s['draws']}D — {wr:.1f}% win rate"
     )
-    await reply_or_send(update, context, text, rematch_kb())
 
-# ── PvP: Challenge ────────────────────────────────────────────────────────────
-async def pvp_challenge(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user  = update.effective_user
-    name  = display_name(user)
-    ensure_user(user)
-    await answer_query(query)
+    await safe_answer(q)
+    if update.effective_chat.type in ("group", "supergroup"):
+        await safe_send(
+            context.bot, update.effective_chat.id, text, kb_rematch(),
+            thread_id=update.effective_message.message_thread_id,
+        )
+    else:
+        try:
+            await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_rematch())
+        except TelegramError:
+            pass
+
+# ── PvP: Issue challenge ──────────────────────────────────────────────────────
+async def cb_pvp_challenge(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q    = update.callback_query
+    user = update.effective_user
+    upsert_user(user)
+    await safe_answer(q)
 
     cid = f"{user.id}_{int(time.time())}"
     pvp_games[cid] = {
-        "cid":      cid,
         "c_id":     user.id,
-        "c_name":   name,
+        "c_name":   name(user),
         "a_id":     None,
         "a_name":   None,
         "c_choice": None,
@@ -308,93 +311,118 @@ async def pvp_challenge(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "chat_id":  update.effective_chat.id,
         "thread_id":update.effective_message.message_thread_id,
         "msg_id":   None,
-        "state":    "waiting",
+        "state":    "waiting",          # waiting → choosing → done
     }
 
-    markup = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Accept", callback_data=f"pvp_accept_{cid}"),
-        InlineKeyboardButton("❌ Cancel", callback_data=f"pvp_cancel_{cid}"),
-    ]])
+    msg_id = await safe_send(
+        context.bot,
+        update.effective_chat.id,
+        f"⚔️ <b>{name(user)} wants to play Rock Paper Scissors!</b>\n\n"
+        f"Tap <b>Accept</b> within {CHALLENGE_TTL}s to play.\n"
+        f"<i>({name(user)} cannot accept their own challenge.)</i>",
+        InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Accept", callback_data=f"pvp_accept_{cid}"),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"pvp_cancel_{cid}"),
+        ]]),
+        thread_id=update.effective_message.message_thread_id,
+    )
 
-    try:
-        sent = await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=(
-                f"⚔️ <b>{name} challenges you to Rock Paper Scissors!</b>\n\n"
-                f"Tap <b>Accept</b> within 60 s.\n"
-                f"<i>({name} cannot accept their own challenge.)</i>"
-            ),
-            parse_mode=ParseMode.HTML, reply_markup=markup,
-            message_thread_id=update.effective_message.message_thread_id,
-        )
-        pvp_games[cid]["msg_id"] = sent.message_id
-    except TelegramError as e:
-        logger.warning("pvp_challenge send: %s", e)
+    if msg_id is None:
         pvp_games.pop(cid, None)
         return
 
+    pvp_games[cid]["msg_id"] = msg_id
+
     context.job_queue.run_once(
-        _expire_challenge, CHALLENGE_TIMEOUT,
+        _job_expire_challenge, CHALLENGE_TTL,
         data={"cid": cid}, name=f"expire_{cid}",
     )
+    logger.info("Challenge created: %s by %s", cid, name(user))
 
-async def _expire_challenge(context: ContextTypes.DEFAULT_TYPE):
+async def _job_expire_challenge(context: ContextTypes.DEFAULT_TYPE):
     cid  = context.job.data["cid"]
     game = pvp_games.pop(cid, None)
     if not game or game["state"] != "waiting":
         return
-    try:
-        await context.bot.edit_message_text(
-            chat_id=game["chat_id"], message_id=game["msg_id"],
-            text=f"⏰ <b>Challenge expired.</b>\n{game['c_name']}'s challenge wasn't accepted in time.",
-            parse_mode=ParseMode.HTML,
-        )
-    except TelegramError:
-        pass
+    logger.info("Challenge expired: %s", cid)
+    await safe_edit(
+        context.bot, game["chat_id"], game["msg_id"],
+        f"⏰ <b>Challenge expired.</b>\n"
+        f"{game['c_name']}'s challenge wasn't accepted in time.",
+    )
 
 # ── PvP: Accept ───────────────────────────────────────────────────────────────
-async def pvp_accept(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user  = update.effective_user
-    cid   = query.data[len("pvp_accept_"):]
-    game  = pvp_games.get(cid)
+async def cb_pvp_accept(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q    = update.callback_query
+    user = update.effective_user
+    cid  = q.data[len("pvp_accept_"):]
 
-    if not game:
-        return await answer_query(query, "⏰ Challenge expired!", alert=True)
+    logger.info("pvp_accept triggered: cid=%s user=%s", cid, user.id)
+
+    game = pvp_games.get(cid)
+
+    # ── Guards ────────────────────────────────────────────────────────────────
+    if game is None:
+        await safe_answer(q, "⏰ This challenge has expired!", alert=True)
+        return
+
     if game["state"] != "waiting":
-        return await answer_query(query, "❌ Already accepted!", alert=True)
-    if user.id == game["c_id"]:
-        return await answer_query(query, "😅 You can't accept your own challenge!", alert=True)
+        await safe_answer(q, "❌ Challenge already accepted by someone else!", alert=True)
+        return
 
-    ensure_user(user)
+    if user.id == game["c_id"]:
+        await safe_answer(q, "😅 You can't accept your own challenge!", alert=True)
+        return
+
+    # ── Accept ────────────────────────────────────────────────────────────────
+    upsert_user(user)
     game["a_id"]   = user.id
-    game["a_name"] = display_name(user)
+    game["a_name"] = name(user)
     game["state"]  = "choosing"
 
+    # Cancel expiry job
     for job in context.job_queue.get_jobs_by_name(f"expire_{cid}"):
         job.schedule_removal()
 
-    await answer_query(query, "✅ Accepted! Tap your move below 👇")
+    logger.info("Challenge accepted: %s by %s", cid, name(user))
 
-    await edit_or_send(
-        context, game["chat_id"], game["msg_id"],
-        text=(
-            f"⚔️ <b>{game['c_name']} vs {game['a_name']}</b>\n\n"
-            f"⏳ {game['c_name']} — not picked yet\n"
-            f"⏳ {game['a_name']} — not picked yet\n\n"
-            f"<b>Both players: tap your move below!</b>\n"
-            f"<i>Your pick is hidden until both have chosen.</i>"
-        ),
-        markup=pvp_pick_kb(cid),
-        thread_id=game["thread_id"],
+    # Answer the query FIRST (Telegram requires this within a few seconds)
+    await safe_answer(q, "✅ Challenge accepted! Pick your move 👇")
+
+    # Update the group message with pick buttons
+    pick_text = (
+        f"⚔️ <b>{game['c_name']} vs {game['a_name']}</b>\n\n"
+        f"⏳ {game['c_name']} — hasn't picked yet\n"
+        f"⏳ {game['a_name']} — hasn't picked yet\n\n"
+        f"<b>Tap your move below!</b>\n"
+        f"<i>Picks are secret until both players choose.</i>"
     )
 
+    edited = await safe_edit(
+        context.bot, game["chat_id"], game["msg_id"],
+        pick_text, kb_pick(cid),
+    )
+
+    if not edited:
+        # edit failed — send a fresh message and store its id
+        new_id = await safe_send(
+            context.bot, game["chat_id"], pick_text, kb_pick(cid),
+            thread_id=game["thread_id"],
+        )
+        if new_id:
+            game["msg_id"] = new_id
+        else:
+            logger.error("Could not send pick message for cid=%s — game aborted", cid)
+            pvp_games.pop(cid, None)
+            return
+
+    # Start pick timeout
     context.job_queue.run_once(
-        _expire_choice, CHOICE_TIMEOUT,
-        data={"cid": cid}, name=f"choice_{cid}",
+        _job_expire_picks, PICK_TTL,
+        data={"cid": cid}, name=f"picks_{cid}",
     )
 
-async def _expire_choice(context: ContextTypes.DEFAULT_TYPE):
+async def _job_expire_picks(context: ContextTypes.DEFAULT_TYPE):
     cid  = context.job.data["cid"]
     game = pvp_games.pop(cid, None)
     if not game or game["state"] != "choosing":
@@ -402,57 +430,57 @@ async def _expire_choice(context: ContextTypes.DEFAULT_TYPE):
     who = []
     if not game["c_choice"]: who.append(game["c_name"])
     if not game["a_choice"]: who.append(game["a_name"])
-    didnt = " &amp; ".join(who) if who else "Someone"
-    try:
-        await context.bot.edit_message_text(
-            chat_id=game["chat_id"], message_id=game["msg_id"],
-            text=f"⏰ <b>Game timed out!</b>\n{didnt} didn't pick in time.",
-            parse_mode=ParseMode.HTML,
-        )
-    except TelegramError:
-        pass
+    logger.info("Pick timeout: %s — didn't pick: %s", cid, who)
+    await safe_edit(
+        context.bot, game["chat_id"], game["msg_id"],
+        f"⏰ <b>Time's up!</b>\n"
+        f"{' &amp; '.join(who)} didn't pick in time.\n"
+        f"Game cancelled.",
+    )
 
 # ── PvP: Cancel ───────────────────────────────────────────────────────────────
-async def pvp_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user  = update.effective_user
-    cid   = query.data[len("pvp_cancel_"):]
-    game  = pvp_games.get(cid)
+async def cb_pvp_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q    = update.callback_query
+    user = update.effective_user
+    cid  = q.data[len("pvp_cancel_"):]
+    game = pvp_games.get(cid)
 
-    if not game:
-        return await answer_query(query, "Already expired.", alert=True)
+    if game is None:
+        await safe_answer(q, "Already expired.", alert=True)
+        return
     if user.id != game["c_id"]:
-        return await answer_query(query, "Only the challenger can cancel!", alert=True)
+        await safe_answer(q, "Only the challenger can cancel!", alert=True)
+        return
 
     pvp_games.pop(cid, None)
     for job in context.job_queue.get_jobs_by_name(f"expire_{cid}"):
         job.schedule_removal()
 
-    await answer_query(query, "Cancelled.")
-    try:
-        await query.edit_message_text(
-            f"❌ <b>{game['c_name']} cancelled the challenge.</b>",
-            parse_mode=ParseMode.HTML,
-        )
-    except TelegramError:
-        pass
+    await safe_answer(q, "Challenge cancelled.")
+    await safe_edit(
+        context.bot, game["chat_id"], game["msg_id"],
+        f"❌ <b>{game['c_name']} cancelled the challenge.</b>",
+    )
 
-# ── PvP: Pick ─────────────────────────────────────────────────────────────────
-async def pvp_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user  = update.effective_user
+# ── PvP: Pick move ────────────────────────────────────────────────────────────
+async def cb_pvp_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q    = update.callback_query
+    user = update.effective_user
 
-    # data = "pvp_pick_{cid}_{choice}"  — cid itself may contain underscores
-    raw        = query.data[len("pvp_pick_"):]
-    choice_str = raw.rsplit("_", 1)[1]   # last segment = rock/paper/scissors
-    cid        = raw.rsplit("_", 1)[0]   # everything before = challenge id
+    # callback_data = "pvp_pick_{cid}_{choice}"
+    # cid itself contains underscores → split from right once
+    raw        = q.data[len("pvp_pick_"):]          # "{cid}_{choice}"
+    choice_str = raw.rsplit("_", 1)[1]               # rock / paper / scissors
+    cid        = raw.rsplit("_", 1)[0]               # everything before
+
+    logger.info("pvp_pick: cid=%s user=%s choice=%s", cid, user.id, choice_str)
 
     game = pvp_games.get(cid)
-
     if not game or game["state"] != "choosing":
-        await answer_query(query, "⏰ This game has already ended!", alert=True)
+        await safe_answer(q, "⏰ This game has already ended!", alert=True)
+        # Remove stale buttons
         try:
-            await query.edit_message_reply_markup(None)
+            await q.edit_message_reply_markup(reply_markup=None)
         except TelegramError:
             pass
         return
@@ -461,174 +489,201 @@ async def pvp_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_a = user.id == game["a_id"]
 
     if not is_c and not is_a:
-        return await answer_query(query, "❌ You're not in this game!", alert=True)
+        await safe_answer(q, "❌ You're not part of this game!", alert=True)
+        return
 
-    chosen = {"rock": Choice.ROCK, "paper": Choice.PAPER, "scissors": Choice.SCISSORS}[choice_str]
+    chosen = CHOICE_FROM_STR.get(choice_str)
+    if not chosen:
+        return
 
+    # Record pick (prevent double-pick)
     if is_c:
         if game["c_choice"]:
-            return await answer_query(query, "✅ Already picked! Waiting for opponent…")
+            await safe_answer(q, "✅ You already picked! Waiting for opponent…")
+            return
         game["c_choice"] = chosen
     else:
         if game["a_choice"]:
-            return await answer_query(query, "✅ Already picked! Waiting for opponent…")
+            await safe_answer(q, "✅ You already picked! Waiting for opponent…")
+            return
         game["a_choice"] = chosen
 
-    # Private confirmation toast — only the button-tapper sees this
-    await answer_query(query, f"✅ Locked in {chosen.value}! Waiting for opponent…")
+    # Confirm pick privately — only the tapper sees this toast
+    await safe_answer(q, f"✅ You picked {chosen.value}! Waiting for opponent…")
 
     c_done = game["c_choice"] is not None
     a_done = game["a_choice"] is not None
 
-    # ── Both picked → resolve ─────────────────────────────────────────────────
+    # ── Both picked → resolve now ─────────────────────────────────────────────
     if c_done and a_done:
-        for job in context.job_queue.get_jobs_by_name(f"choice_{cid}"):
+        for job in context.job_queue.get_jobs_by_name(f"picks_{cid}"):
             job.schedule_removal()
 
-        c_ch = game["c_choice"]
-        a_ch = game["a_choice"]
-        r    = beats(c_ch, a_ch)
+        cc = game["c_choice"]
+        ac = game["a_choice"]
+        r  = beats(cc, ac)
 
         if r == 1:
-            headline = f"🏆 <b>{game['c_name']} wins!</b>"
-            save_pvp_game(game["c_id"], game["a_id"], c_ch.name, a_ch.name, "win")
-            save_pvp_game(game["a_id"], game["c_id"], a_ch.name, c_ch.name, "loss")
+            headline   = f"🏆 <b>{game['c_name']} wins!</b>"
+            c_res, a_res = "win", "loss"
         elif r == -1:
-            headline = f"🏆 <b>{game['a_name']} wins!</b>"
-            save_pvp_game(game["c_id"], game["a_id"], c_ch.name, a_ch.name, "loss")
-            save_pvp_game(game["a_id"], game["c_id"], a_ch.name, c_ch.name, "win")
+            headline   = f"🏆 <b>{game['a_name']} wins!</b>"
+            c_res, a_res = "loss", "win"
         else:
-            headline = "🤝 <b>It's a Draw!</b>"
-            save_pvp_game(game["c_id"], game["a_id"], c_ch.name, a_ch.name, "draw")
-            save_pvp_game(game["a_id"], game["c_id"], a_ch.name, c_ch.name, "draw")
+            headline   = "🤝 <b>It's a Draw!</b>"
+            c_res, a_res = "draw", "draw"
 
+        record_pvp(game["c_id"], game["a_id"], cc.name, ac.name, c_res)
+        record_pvp(game["a_id"], game["c_id"], ac.name, cc.name, a_res)
         pvp_games.pop(cid, None)
+        logger.info("PvP result: %s vs %s → %s", game["c_name"], game["a_name"], headline)
 
-        await edit_or_send(
-            context, game["chat_id"], game["msg_id"],
-            text=(
-                f"⚔️ <b>{game['c_name']} vs {game['a_name']}</b>\n\n"
-                f"{game['c_name']}: {c_ch.value}\n"
-                f"{game['a_name']}: {a_ch.value}\n\n"
-                f"{headline}"
-            ),
-            markup=pvp_newgame_kb(),
-            thread_id=game["thread_id"],
+        await safe_edit(
+            context.bot, game["chat_id"], game["msg_id"],
+            f"⚔️ <b>{game['c_name']} vs {game['a_name']}</b>\n\n"
+            f"{game['c_name']}: {cc.value}\n"
+            f"{game['a_name']}: {ac.value}\n\n"
+            f"{headline}",
+            kb_after_pvp(),
         )
         return
 
-    # ── One picked, waiting for other ────────────────────────────────────────
-    c_status = f"✅ {game['c_name']} — ready!" if c_done else f"⏳ {game['c_name']} — choosing…"
-    a_status = f"✅ {game['a_name']} — ready!" if a_done else f"⏳ {game['a_name']} — choosing…"
+    # ── Still waiting for one player ──────────────────────────────────────────
+    c_line = f"✅ {game['c_name']} — locked in!" if c_done else f"⏳ {game['c_name']} — choosing…"
+    a_line = f"✅ {game['a_name']} — locked in!" if a_done else f"⏳ {game['a_name']} — choosing…"
 
-    await edit_or_send(
-        context, game["chat_id"], game["msg_id"],
-        text=(
-            f"⚔️ <b>{game['c_name']} vs {game['a_name']}</b>\n\n"
-            f"{c_status}\n{a_status}\n\n"
-            f"<i>Choices are hidden until both lock in.</i>"
-        ),
-        markup=pvp_pick_kb(cid),
-        thread_id=game["thread_id"],
+    await safe_edit(
+        context.bot, game["chat_id"], game["msg_id"],
+        f"⚔️ <b>{game['c_name']} vs {game['a_name']}</b>\n\n"
+        f"{c_line}\n{a_line}\n\n"
+        f"<i>Picks hidden until both choose.</i>",
+        kb_pick(cid),
     )
 
-# ── Stats / Leaderboard builders ──────────────────────────────────────────────
-def _stats_text(name: str, stats) -> str:
-    if not stats or (stats['total_games'] == 0 and stats['pvp_games'] == 0):
-        return f"📊 <b>{name}'s Stats</b>\n\nNo games yet! Hit Play 👇"
-    bt, pt = stats['total_games'], stats['pvp_games']
-    bwr = stats['wins']     / bt * 100 if bt else 0
-    pwr = stats['pvp_wins'] / pt * 100 if pt else 0
+# ── Stats / Leaderboard (text builders) ──────────────────────────────────────
+def _fmt_stats(uname: str, s) -> str:
+    if not s or (s["total_games"] == 0 and s["pvp_games"] == 0):
+        return f"📊 <b>{uname}'s Stats</b>\n\nNo games yet! Play below 👇"
+    bt  = s["total_games"]
+    pt  = s["pvp_games"]
+    bwr = s["wins"]     / bt * 100 if bt else 0
+    pwr = s["pvp_wins"] / pt * 100 if pt else 0
     return (
-        f"📊 <b>{name}'s Stats</b>\n\n"
+        f"📊 <b>{uname}'s Stats</b>\n\n"
         f"🤖 <b>vs Bot</b> ({bt} games)\n"
-        f"{stats['wins']}W {stats['losses']}L {stats['draws']}D — {bwr:.1f}%\n\n"
+        f"{s['wins']}W  {s['losses']}L  {s['draws']}D  —  {bwr:.1f}%\n\n"
         f"⚔️ <b>vs Players</b> ({pt} games)\n"
-        f"{stats['pvp_wins']}W {stats['pvp_losses']}L {stats['pvp_draws']}D — {pwr:.1f}%"
+        f"{s['pvp_wins']}W  {s['pvp_losses']}L  {s['pvp_draws']}D  —  {pwr:.1f}%"
     )
 
-def _lb_text() -> str:
-    conn = get_db()
-    rows = conn.execute(
-        "SELECT * FROM users WHERE total_games>0 OR pvp_games>0 ORDER BY (wins+pvp_wins) DESC LIMIT 10"
+def _fmt_lb() -> str:
+    rows = db().execute(
+        "SELECT * FROM users WHERE total_games>0 OR pvp_games>0 "
+        "ORDER BY (wins+pvp_wins) DESC LIMIT 10"
     ).fetchall()
-    conn.close()
     if not rows:
         return "🏆 <b>Leaderboard</b>\n\nNo players yet!"
-    out    = "🏆 <b>Top 10 Players</b>\n\n"
-    medals = ["🥇","🥈","🥉"]
-    for i, u in enumerate(rows, 1):
-        u  = dict(u)
-        m  = medals[i-1] if i <= 3 else f"{i}."
-        tw = u['wins'] + u['pvp_wins']
-        tl = u['losses'] + u['pvp_losses']
-        td = u['draws'] + u['pvp_draws']
-        tg = u['total_games'] + u['pvp_games']
+    medals = ["🥇", "🥈", "🥉"]
+    out = "🏆 <b>Top 10 Players</b>\n\n"
+    for i, r in enumerate(rows, 1):
+        r  = dict(r)
+        tw = r["wins"] + r["pvp_wins"]
+        tl = r["losses"] + r["pvp_losses"]
+        td = r["draws"] + r["pvp_draws"]
+        tg = r["total_games"] + r["pvp_games"]
         wr = tw / tg * 100 if tg else 0
-        out += f"{m} <b>{display_name_db(u)}</b>\n   {tw}W {td}D {tl}L ({wr:.0f}%)\n\n"
+        out += f"{medals[i-1] if i<=3 else f'{i}.'} <b>{name_db(r)}</b>\n   {tw}W {td}D {tl}L  ({wr:.0f}%)\n\n"
     return out
 
-# ── Callback handlers: stats / leaderboard / rules / menu ────────────────────
+# ── Navigation callbacks ──────────────────────────────────────────────────────
 async def cb_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q    = update.callback_query
     user = update.effective_user
-    ensure_user(user)
+    upsert_user(user)
+    await safe_answer(q)
+    text   = _fmt_stats(name(user), fetch_stats(user.id))
     markup = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🎮 Play", callback_data="main_menu"),
+        InlineKeyboardButton("🎮 Play",        callback_data="main_menu"),
         InlineKeyboardButton("🏆 Leaderboard", callback_data="show_leaderboard"),
     ]])
-    await reply_or_send(update, context, _stats_text(display_name(user), get_stats(user.id)), markup)
+    if update.effective_chat.type in ("group", "supergroup"):
+        await safe_send(context.bot, update.effective_chat.id, text, markup,
+                        thread_id=update.effective_message.message_thread_id)
+    else:
+        try:
+            await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        except TelegramError:
+            pass
 
 async def cb_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await safe_answer(q)
     markup = InlineKeyboardMarkup([[InlineKeyboardButton("🎮 Play", callback_data="main_menu")]])
-    await reply_or_send(update, context, _lb_text(), markup)
+    if update.effective_chat.type in ("group", "supergroup"):
+        await safe_send(context.bot, update.effective_chat.id, _fmt_lb(), markup,
+                        thread_id=update.effective_message.message_thread_id)
+    else:
+        try:
+            await q.edit_message_text(_fmt_lb(), parse_mode=ParseMode.HTML, reply_markup=markup)
+        except TelegramError:
+            pass
 
 async def cb_rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q    = update.callback_query
     text = (
         "📖 <b>How to Play</b>\n\n"
         "🪨 Rock beats ✂️ Scissors\n"
         "✂️ Scissors beats 📄 Paper\n"
         "📄 Paper beats 🪨 Rock\n\n"
-        "<b>🤖 vs Bot:</b> Pick a move — bot picks randomly.\n\n"
-        "<b>⚔️ vs Friend:</b>\n"
+        "<b>🤖 vs Bot:</b> Pick any move — bot picks randomly.\n\n"
+        "<b>⚔️ vs Friend (group):</b>\n"
         "1. Tap ⚔️ Challenge a Friend\n"
-        "2. Friend taps Accept (within 60 s)\n"
-        "3. Both tap your move on the same message\n"
-        "4. Picks stay secret until both lock in\n"
-        "5. Result revealed automatically! 🎉\n\n"
-        "<i>No DMs needed — works entirely in chat.</i>"
+        "2. A friend taps ✅ Accept (60 s window)\n"
+        "3. Both tap 🪨 📄 or ✂️ on the same message\n"
+        "4. Picks stay <b>secret</b> until both lock in\n"
+        "5. Winner revealed automatically! 🎉\n\n"
+        "<i>No DMs needed — everything happens right here.</i>"
     )
     markup = InlineKeyboardMarkup([[InlineKeyboardButton("🎮 Back", callback_data="main_menu")]])
-    await reply_or_send(update, context, text, markup)
+    await safe_answer(q)
+    if update.effective_chat.type in ("group", "supergroup"):
+        await safe_send(context.bot, update.effective_chat.id, text, markup,
+                        thread_id=update.effective_message.message_thread_id)
+    else:
+        try:
+            await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        except TelegramError:
+            pass
 
 async def cb_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await answer_query(query)
+    q = update.callback_query
+    await safe_answer(q)
     try:
-        await query.edit_message_text(
-            "🎮 <b>Rock, Paper, Scissors</b>\n\nPick your move!",
-            parse_mode=ParseMode.HTML, reply_markup=main_kb(),
+        await q.edit_message_text(
+            "🎮 <b>Rock Paper Scissors</b>\n\nPick your move!",
+            parse_mode=ParseMode.HTML, reply_markup=kb_main(),
         )
     except TelegramError:
         pass
 
 # ── Error handler ─────────────────────────────────────────────────────────────
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error("Error: %s", context.error, exc_info=context.error)
+async def err_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Unhandled error: %s", context.error, exc_info=context.error)
 
-# ── post_init ─────────────────────────────────────────────────────────────────
-async def post_init(application: Application):
+# ── Bot setup ─────────────────────────────────────────────────────────────────
+async def on_startup(app: Application):
     try:
-        await application.bot.set_my_commands([
-            BotCommand("start",       "Start the bot 🎮"),
-            BotCommand("stats",       "My statistics 📊"),
-            BotCommand("leaderboard", "Global leaderboard 🏆"),
+        await app.bot.set_my_commands([
+            BotCommand("start",       "Play the game 🎮"),
+            BotCommand("stats",       "My stats 📊"),
+            BotCommand("leaderboard", "Leaderboard 🏆"),
         ])
+        logger.info("Commands registered.")
     except TelegramError as e:
         logger.warning("set_my_commands: %s", e)
 
-# ── main ──────────────────────────────────────────────────────────────────────
 def main():
-    init_database()
+    init_db()
 
     try:
         from dotenv import load_dotenv
@@ -638,7 +693,7 @@ def main():
 
     token = os.getenv("BOT_TOKEN")
     if not token:
-        logger.critical("BOT_TOKEN not set!")
+        logger.critical("BOT_TOKEN env var not set — exiting.")
         sys.exit(1)
 
     app = (
@@ -648,27 +703,33 @@ def main():
         .read_timeout(30)
         .write_timeout(30)
         .pool_timeout(30)
-        .post_init(post_init)
+        .post_init(on_startup)
         .build()
     )
 
+    # Commands
     app.add_handler(CommandHandler("start",       cmd_start))
     app.add_handler(CommandHandler("stats",       cmd_stats))
     app.add_handler(CommandHandler("leaderboard", cmd_leaderboard))
 
-    app.add_handler(CallbackQueryHandler(play_single,    pattern="^play_"))
-    app.add_handler(CallbackQueryHandler(pvp_challenge,  pattern="^pvp_challenge$"))
-    app.add_handler(CallbackQueryHandler(pvp_accept,     pattern="^pvp_accept_"))
-    app.add_handler(CallbackQueryHandler(pvp_cancel,     pattern="^pvp_cancel_"))
-    app.add_handler(CallbackQueryHandler(pvp_pick,       pattern="^pvp_pick_"))
+    # vs Bot
+    app.add_handler(CallbackQueryHandler(cb_play,          pattern="^play_"))
+
+    # PvP  (order matters — most specific patterns first)
+    app.add_handler(CallbackQueryHandler(cb_pvp_challenge, pattern="^pvp_challenge$"))
+    app.add_handler(CallbackQueryHandler(cb_pvp_accept,    pattern="^pvp_accept_"))
+    app.add_handler(CallbackQueryHandler(cb_pvp_cancel,    pattern="^pvp_cancel_"))
+    app.add_handler(CallbackQueryHandler(cb_pvp_pick,      pattern="^pvp_pick_"))
+
+    # Navigation
     app.add_handler(CallbackQueryHandler(cb_stats,       pattern="^show_stats$"))
     app.add_handler(CallbackQueryHandler(cb_leaderboard, pattern="^show_leaderboard$"))
     app.add_handler(CallbackQueryHandler(cb_rules,       pattern="^rules$"))
     app.add_handler(CallbackQueryHandler(cb_main_menu,   pattern="^main_menu$"))
 
-    app.add_error_handler(error_handler)
+    app.add_error_handler(err_handler)
 
-    logger.info("Bot started.")
+    logger.info("Bot polling…")
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
