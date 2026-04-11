@@ -116,10 +116,19 @@ def record_bot(uid, uchoice, bchoice, result):
 
 # ── Name helpers ──────────────────────────────────────────────────────────────
 def name(user) -> str:
-    n = (user.first_name or "")
+    """
+    FIX: old version had broken operator precedence on the last return line.
+    Now correctly prioritises: first+last name → @username → 'Player'
+    """
+    n = (user.first_name or "").strip()
     if user.last_name:
         n += f" {user.last_name}"
-    return n.strip() or f"@{user.username}" if user.username else "Player"
+    n = n.strip()
+    if n:
+        return n
+    if user.username:
+        return f"@{user.username}"
+    return "Player"
 
 def name_db(row: dict) -> str:
     n = f"{row.get('first_name') or ''} {row.get('last_name') or ''}".strip()
@@ -127,7 +136,6 @@ def name_db(row: dict) -> str:
 
 # ── Keyboards ─────────────────────────────────────────────────────────────────
 def kb_main() -> InlineKeyboardMarkup:
-    # REMOVED Challenge button
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("🪨 Rock",     callback_data="play_rock"),
@@ -243,10 +251,10 @@ async def cb_play(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tot = s["total_games"]
     wr  = s["wins"] / tot * 100 if tot else 0
 
-    # FIXED: Shows FULL NAME clearly in groups
+    # Shows player's first name clearly — name() now returns it correctly
     text = (
         f"{icon} <b>{head}</b>\n\n"
-        f"<b>{name(user)}</b>: {uc.value}  |  Bot: {bc.value}\n\n"
+        f"<b>{name(user)}</b>: {uc.value}  |  🤖 Bot: {bc.value}\n\n"
         f"📊 {s['wins']}W {s['losses']}L {s['draws']}D — <b>{wr:.1f}%</b> win rate"
     )
 
@@ -409,7 +417,7 @@ def main():
     app.add_handler(CommandHandler("leaderboard", cmd_leaderboard))
 
     # vs Bot ONLY
-    app.add_handler(CallbackQueryHandler(cb_play,          pattern="^play_"))
+    app.add_handler(CallbackQueryHandler(cb_play,        pattern="^play_"))
 
     # Navigation
     app.add_handler(CallbackQueryHandler(cb_stats,       pattern="^show_stats$"))
@@ -420,9 +428,14 @@ def main():
     app.add_error_handler(err_handler)
 
     logger.info("Bot polling…")
+
+    # Railway-safe: run_polling handles its own event loop cleanly.
+    # Never call asyncio.get_event_loop().close() or loop.run_until_complete()
+    # alongside run_polling — it manages the loop internally.
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
+        close_loop=False,       # Railway keeps the process alive; don't close the loop on shutdown
     )
 
 if __name__ == "__main__":
